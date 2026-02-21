@@ -7,7 +7,7 @@ from fake_useragent import UserAgent
 from aiohttp_socks import ProxyConnector
 import os
 
-# Регулярка для поиска прокси
+# Regular expression for matching proxy patterns
 REGEX = compile(
     r"(?:^|\D)?(("+ r"(?:[1-9]|[1-9]\d|1\d{2}|2[0-4]\d|25[0-5])"
     + r"\." + r"(?:\d|[1-9]\d|1\d{2}|2[0-4]\d|25[0-5])"
@@ -18,34 +18,54 @@ REGEX = compile(
     + r")(?:\D|$)"
 )
 
-WORKING_FILE = "working.txt"  # файл для хранения рабочих прокси
+WORKING_FILE = "working.txt"
+
+def safe_str(text):
+    """Безопасное преобразование в строку без ошибок кодировки"""
+    if text is None:
+        return ""
+    try:
+        # Пробуем заменить проблемные символы
+        if isinstance(text, bytes):
+            return text.decode('utf-8', errors='replace')
+        return str(text).encode('utf-8', errors='replace').decode('utf-8')
+    except:
+        return str(text).encode('ascii', errors='ignore').decode('ascii')
 
 def log(message):
     timestamp = datetime.now().strftime("%H:%M:%S")
-    print(f"[{timestamp}] {message}")
+    safe_msg = safe_str(message)
+    print(f"[{timestamp}] {safe_msg}")
 
 def load_working_proxies():
     """Загружает список рабочих прокси из файла"""
     if not os.path.exists(WORKING_FILE):
         return []
-    with open(WORKING_FILE, "r") as f:
-        proxies = [line.strip() for line in f if line.strip()]
-    log(f"Loaded {len(proxies)} working proxies from {WORKING_FILE}")
-    return proxies
+    try:
+        with open(WORKING_FILE, "r", encoding='utf-8', errors='ignore') as f:
+            proxies = [line.strip() for line in f if line.strip()]
+        log(f"Loaded {len(proxies)} working proxies from {WORKING_FILE}")
+        return proxies
+    except Exception as e:
+        log(f"Error loading working proxies: {safe_str(e)}")
+        return []
 
 def save_working_proxy(proxy_str):
     """Сохраняет прокси в файл рабочих, если его там ещё нет"""
     if not proxy_str:
         return
-    # Проверяем, есть ли уже
-    existing = set()
-    if os.path.exists(WORKING_FILE):
-        with open(WORKING_FILE, "r") as f:
-            existing = set(line.strip() for line in f if line.strip())
-    if proxy_str not in existing:
-        with open(WORKING_FILE, "a") as f:
-            f.write(proxy_str + "\n")
-        log(f"Saved working proxy: {proxy_str}")
+    try:
+        # Проверяем, есть ли уже
+        existing = set()
+        if os.path.exists(WORKING_FILE):
+            with open(WORKING_FILE, "r", encoding='utf-8', errors='ignore') as f:
+                existing = set(line.strip() for line in f if line.strip())
+        if proxy_str not in existing:
+            with open(WORKING_FILE, "a", encoding='utf-8', errors='ignore') as f:
+                f.write(proxy_str + "\n")
+            log(f"Saved working proxy: {proxy_str}")
+    except Exception as e:
+        log(f"Error saving working proxy: {safe_str(e)}")
 
 class Telegram:
     def __init__(self, channel: str, post: int, concurrency: int = 100) -> None:
@@ -77,9 +97,8 @@ class Telegram:
                             log("ERROR: No cookies received")
                             return
 
-                        views_token = search(
-                            'data-view="([^"]+)"', await embed_response.text()
-                        )
+                        embed_text = await embed_response.text()
+                        views_token = search('data-view="([^"]+)"', embed_text)
 
                         if not views_token:
                             log("ERROR: No view token found")
@@ -95,64 +114,69 @@ class Telegram:
                             timeout=aiohttp.ClientTimeout(total=5),
                         )
 
-                        if (
-                            await views_response.text() == "true"
-                            and views_response.status == 200
-                        ):
+                        views_text = await views_response.text()
+                        if views_text == "true" and views_response.status == 200:
                             log("SUCCESS: View sent")
-                            # Сохраняем рабочий прокси
                             save_working_proxy(f"{proxy_type}://{proxy}")
                         else:
                             log("FAILED: View not registered")
 
+        except asyncio.CancelledError:
+            log(f"Task cancelled for proxy {proxy_type}://{proxy}")
         except Exception as e:
-            log(f"ERROR: Proxy connection failed - {proxy_type}://{proxy} - {str(e)[:50]}...")
-
+            log(f"ERROR: Proxy connection failed - {proxy_type}://{proxy} - {safe_str(e)[:50]}...")
         finally:
             if 'jar' in locals():
                 jar.clear()
 
     async def run_proxies_continuous(self, proxies_list, proxy_type):
-        """
-        Запускает бесконечные задачи для списка прокси.
-        proxies_list может быть списком строк вида "ip:port" или уже с типом?
-        В данном методе ожидается, что прокси передаются без типа, а тип отдельно.
-        """
         log(f"Starting continuous mode with {len(proxies_list)} proxies of type {proxy_type}")
-        tasks = [
-            asyncio.create_task(self.continuous_request(proxy, proxy_type))
-            for proxy in proxies_list
-        ]
-        await asyncio.gather(*tasks)
-
-    async def continuous_request(self, proxy: str, proxy_type: str):
-        while True:
-            await self.request(proxy, proxy_type)
-            # Небольшая пауза между запросами с одного прокси
-            await asyncio.sleep(1)
-
-    async def run_auto_continuous(self, proxies):
-        """
-        Запускает бесконечные задачи для списка прокси с их типами.
-        proxies: список кортежей (proxy_type, proxy)
-        """
-        log(f"Starting continuous auto mode with {len(proxies)} proxies")
-        tasks = [
-            asyncio.create_task(self.continuous_request(proxy, proxy_type))
-            for proxy_type, proxy in proxies
-        ]
+        tasks = []
+        for proxy in proxies_list:
+            task = asyncio.create_task(self.continuous_request(proxy, proxy_type))
+            tasks.append(task)
+            await asyncio.sleep(0.1)  # Небольшая задержка при запуске
+        
         try:
             await asyncio.gather(*tasks)
         except Exception as e:
-            log(f"Error in auto mode: {str(e)}")
+            log(f"Error in run_proxies_continuous: {safe_str(e)}")
+
+    async def continuous_request(self, proxy: str, proxy_type: str):
+        while True:
+            try:
+                await self.request(proxy, proxy_type)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
+            await asyncio.sleep(1)
+
+    async def run_auto_continuous(self, proxies):
+        log(f"Starting continuous auto mode with {len(proxies)} proxies")
+        tasks = []
+        for proxy_type, proxy in proxies:
+            task = asyncio.create_task(self.continuous_request(proxy, proxy_type))
+            tasks.append(task)
+            await asyncio.sleep(0.1)
+        
+        try:
+            await asyncio.gather(*tasks)
+        except Exception as e:
+            log(f"Error in auto mode: {safe_str(e)}")
 
     async def run_rotated_continuous(self, proxy: str, proxy_type: str):
         log(f"Starting continuous rotated mode with proxy {proxy_type}://{proxy}")
-        tasks = [
-            asyncio.create_task(self.continuous_request(proxy, proxy_type))
-            for _ in range(self.concurrency * 5)
-        ]
-        await asyncio.gather(*tasks)
+        tasks = []
+        for i in range(self.concurrency * 5):
+            task = asyncio.create_task(self.continuous_request(proxy, proxy_type))
+            tasks.append(task)
+            await asyncio.sleep(0.05)
+        
+        try:
+            await asyncio.gather(*tasks)
+        except Exception as e:
+            log(f"Error in rotated mode: {safe_str(e)}")
 
 class Auto:
     def __init__(self):
@@ -171,7 +195,7 @@ class Auto:
                 log(f"Loaded {len(self.socks5_sources)} SOCKS5 proxy sources")
                 
         except FileNotFoundError as e:
-            log(f"ERROR: Auto file not found - {str(e)}")
+            log(f"ERROR: Auto file not found - {safe_str(e)}")
             exit(0)
         
         log("Starting proxy scraping from sources...")
@@ -180,7 +204,7 @@ class Auto:
         try:
             async with aiohttp.ClientSession() as session:
                 headers = {"user-agent": UserAgent().random}
-                log(f"Scraping {proxy_type} proxies from {source_url}")
+                log(f"Scraping {proxy_type} proxies from {source_url[:50]}...")
                 async with session.get(
                     source_url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)
                 ) as response:
@@ -188,12 +212,15 @@ class Auto:
                     matches = REGEX.finditer(html)
                     found_proxies = [(proxy_type, match.group(1)) for match in matches]
                     self.proxies.extend(found_proxies)
-                    log(f"Found {len(found_proxies)} {proxy_type} proxies from {source_url}")
+                    log(f"Found {len(found_proxies)} {proxy_type} proxies from {source_url[:30]}...")
 
         except Exception as e:
-            log(f"ERROR: Failed to scrape from {source_url} - {str(e)[:100]}")
-            with open("error.txt", "a", encoding="utf-8", errors="ignore") as f:
-                f.write(f"{source_url} -> {e}\n")
+            log(f"ERROR: Failed to scrape from {source_url[:50]}... - {safe_str(e)[:100]}")
+            try:
+                with open("error.txt", "a", encoding="utf-8", errors="ignore") as f:
+                    f.write(f"{source_url} -> {safe_str(e)}\n")
+            except:
+                pass
 
     async def init(self):
         tasks = []
@@ -227,55 +254,65 @@ async def main():
     working = load_working_proxies()
     
     if args.mode[0] == "l":  # list mode
-        # Загружаем прокси из указанного файла
-        with open(args.proxy, "r") as file:
-            file_proxies = file.read().splitlines()
-        log(f"Loaded {len(file_proxies)} proxies from file {args.proxy}")
-        
-        # Объединяем с рабочими, удаляем дубли
-        all_proxies = list(set(file_proxies + working))
-        log(f"Total unique proxies after merging with working: {len(all_proxies)}")
-        
-        await api.run_proxies_continuous(all_proxies, args.type)
+        try:
+            with open(args.proxy, "r", encoding='utf-8', errors='ignore') as file:
+                file_proxies = file.read().splitlines()
+            log(f"Loaded {len(file_proxies)} proxies from file {args.proxy}")
+            
+            # Объединяем с рабочими, удаляем дубли
+            all_proxies = list(set(file_proxies + working))
+            log(f"Total unique proxies after merging with working: {len(all_proxies)}")
+            
+            await api.run_proxies_continuous(all_proxies, args.type)
+        except Exception as e:
+            log(f"Error in list mode: {safe_str(e)}")
 
     elif args.mode[0] == "r":  # rotate mode
         log(f"Starting rotated mode with single proxy: {args.proxy}")
         await api.run_rotated_continuous(args.proxy, args.type)
 
     else:  # auto mode
-        # Парсим новые прокси
-        auto = Auto()
-        await auto.init()
-        
-        # Преобразуем спаршенные прокси в строки с типом (для сравнения с working)
-        auto_strings = [f"{pt}://{p}" for pt, p in auto.proxies]
-        working_set = set(working)
-        
-        # Добавляем только те, которых нет в working
-        new_proxies = []
-        for pt, p in auto.proxies:
-            proxy_str = f"{pt}://{p}"
-            if proxy_str not in working_set:
-                new_proxies.append((pt, p))
-        
-        log(f"New proxies from auto (not in working): {len(new_proxies)}")
-        
-        # Объединяем: сначала рабочие (преобразуем в формат (type, ip:port)), потом новые
-        # Рабочие строки имеют вид "type://ip:port", разбираем
-        working_parsed = []
-        for w in working:
-            if "://" in w:
-                pt, addr = w.split("://", 1)
-                working_parsed.append((pt, addr))
+        try:
+            # Парсим новые прокси
+            auto = Auto()
+            await auto.init()
+            
+            # Преобразуем спаршенные прокси в строки с типом
+            auto_strings = [f"{pt}://{p}" for pt, p in auto.proxies]
+            working_set = set(working)
+            
+            # Добавляем только те, которых нет в working
+            new_proxies = []
+            for pt, p in auto.proxies:
+                proxy_str = f"{pt}://{p}"
+                if proxy_str not in working_set:
+                    new_proxies.append((pt, p))
+            
+            log(f"New proxies from auto (not in working): {len(new_proxies)}")
+            
+            # Рабочие строки имеют вид "type://ip:port", разбираем
+            working_parsed = []
+            for w in working:
+                try:
+                    if "://" in w:
+                        pt, addr = w.split("://", 1)
+                        working_parsed.append((pt, addr))
+                    else:
+                        working_parsed.append((args.type or "http", w))
+                except:
+                    continue
+            
+            # Итоговый список для отправки
+            all_proxies = working_parsed + new_proxies
+            log(f"Total proxies to run: {len(all_proxies)}")
+            
+            if all_proxies:
+                await api.run_auto_continuous(all_proxies)
             else:
-                # на всякий случай, если без типа
-                working_parsed.append((args.type or "http", w))
-        
-        # Итоговый список для отправки
-        all_proxies = working_parsed + new_proxies
-        log(f"Total proxies to run: {len(all_proxies)}")
-        
-        await api.run_auto_continuous(all_proxies)
+                log("No proxies to run")
+                
+        except Exception as e:
+            log(f"Fatal error in auto mode: {safe_str(e)}")
 
 if __name__ == "__main__":
     log("Program started")
@@ -284,4 +321,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         log("Program terminated by user")
     except Exception as e:
-        log(f"Unhandled exception: {str(e)}")
+        log(f"Unhandled exception: {safe_str(e)}")
