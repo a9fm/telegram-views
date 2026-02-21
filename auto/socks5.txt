@@ -39,3 +39,4 @@ https://raw.githubusercontent.com/AGDDoS/AGProxy/master/proxies/socks5.txt
 
 # all
 https://raw.githubusercontent.com/dpangestuw/Free-Proxy/refs/heads/main/allive.txt
+https://proxik.cloud/proxy_list
