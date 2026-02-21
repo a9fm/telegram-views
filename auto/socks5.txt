@@ -1,2 +1,2 @@
 https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt
-https://raw.githubusercontent.com/Anonym0usWork1221/Free-Proxies/refs/heads/main/proxy_files/socks5_proxies.txt
+https://raw.githubusercontent.com/dpangestuw/Free-Proxy/refs/heads/main/allive.txt
