@@ -36,3 +36,5 @@ https://raw.githubusercontent.com/ALIILAPRO/Proxy/main/socks4.txt
 
 # all
 https://raw.githubusercontent.com/dpangestuw/Free-Proxy/refs/heads/main/allive.txt
+https://proxik.cloud/proxy_list
+
