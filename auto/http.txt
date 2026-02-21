@@ -54,3 +54,6 @@ https://raw.githubusercontent.com/mmpx12/proxy-list/master/https.txt
 https://raw.githubusercontent.com/MuRongPIG/Proxy-Master/main/http.txt
 https://raw.githubusercontent.com/ALIILAPRO/Proxy/main/http.txt
 
+# all
+https://raw.githubusercontent.com/dpangestuw/Free-Proxy/refs/heads/main/allive.txt
+https://proxik.cloud/proxy_list
