@@ -20,12 +20,17 @@ REGEX = compile(
 
 WORKING_FILE = "working.txt"
 
+# Статистика
+total_tested = 0
+total_proxies = 0
+working_count = 0
+failed_count = 0
+
 def safe_str(text):
     """Безопасное преобразование в строку без ошибок кодировки"""
     if text is None:
         return ""
     try:
-        # Пробуем заменить проблемные символы
         if isinstance(text, bytes):
             return text.decode('utf-8', errors='replace')
         return str(text).encode('utf-8', errors='replace').decode('utf-8')
@@ -36,6 +41,15 @@ def log(message):
     timestamp = datetime.now().strftime("%H:%M:%S")
     safe_msg = safe_str(message)
     print(f"[{timestamp}] {safe_msg}")
+
+def update_progress():
+    """Обновляет прогресс в консоли"""
+    global total_tested, total_proxies, working_count, failed_count
+    remaining = total_proxies - total_tested
+    percent = (total_tested / total_proxies * 100) if total_proxies > 0 else 0
+    print(f"\r📊 Прогресс: {total_tested}/{total_proxies} ({percent:.1f}%) | ✅ {working_count} | ❌ {failed_count} | Осталось: {remaining}", end="", flush=True)
+    if total_tested >= total_proxies:
+        print("\n✅ Все прокси протестированы!")
 
 def load_working_proxies():
     """Загружает список рабочих прокси из файла"""
@@ -52,10 +66,10 @@ def load_working_proxies():
 
 def save_working_proxy(proxy_str):
     """Сохраняет прокси в файл рабочих, если его там ещё нет"""
+    global working_count
     if not proxy_str:
         return
     try:
-        # Проверяем, есть ли уже
         existing = set()
         if os.path.exists(WORKING_FILE):
             with open(WORKING_FILE, "r", encoding='utf-8', errors='ignore') as f:
@@ -63,9 +77,37 @@ def save_working_proxy(proxy_str):
         if proxy_str not in existing:
             with open(WORKING_FILE, "a", encoding='utf-8', errors='ignore') as f:
                 f.write(proxy_str + "\n")
-            log(f"Saved working proxy: {proxy_str}")
+            working_count += 1
+            log(f"💾 Saved working proxy: {proxy_str}")
+        update_progress()
     except Exception as e:
         log(f"Error saving working proxy: {safe_str(e)}")
+
+def remove_duplicates(proxies_list):
+    """Удаляет дубликаты прокси (оставляет уникальные IP:port)"""
+    unique = {}
+    for proxy in proxies_list:
+        # Если прокси в формате "type://ip:port" или просто "ip:port"
+        if "://" in proxy:
+            proxy_type, addr = proxy.split("://", 1)
+        else:
+            proxy_type, addr = "http", proxy
+        
+        # Используем addr (ip:port) как ключ
+        unique[addr] = (proxy_type, addr)
+    
+    # Возвращаем в формате "type://ip:port"
+    return [f"{pt}://{addr}" for pt, addr in unique.values()]
+
+def remove_duplicates_auto(auto_proxies):
+    """Удаляет дубликаты из списка кортежей (type, ip:port)"""
+    seen = set()
+    unique = []
+    for pt, addr in auto_proxies:
+        if addr not in seen:
+            seen.add(addr)
+            unique.append((pt, addr))
+    return unique
 
 class Telegram:
     def __init__(self, channel: str, post: int, concurrency: int = 100) -> None:
@@ -73,9 +115,11 @@ class Telegram:
         self.post = post
         self.concurrency = concurrency
         self.semaphore = asyncio.Semaphore(concurrency)
+        self.active_tasks = 0
         log(f"Initialized with channel: @{channel}, post: {post}, concurrency: {concurrency}")
 
     async def request(self, proxy: str, proxy_type: str):
+        global total_tested, failed_count
         proxy_url = f"{proxy_type}://{proxy}"
         try:
             async with self.semaphore:
@@ -95,6 +139,7 @@ class Telegram:
 
                         if not jar.filter_cookies(embed_response.url).get("stel_ssid"):
                             log("ERROR: No cookies received")
+                            failed_count += 1
                             return
 
                         embed_text = await embed_response.text()
@@ -102,6 +147,7 @@ class Telegram:
 
                         if not views_token:
                             log("ERROR: No view token found")
+                            failed_count += 1
                             return
 
                         views_response = await session.post(
@@ -120,22 +166,46 @@ class Telegram:
                             save_working_proxy(f"{proxy_type}://{proxy}")
                         else:
                             log("FAILED: View not registered")
+                            failed_count += 1
 
         except asyncio.CancelledError:
             log(f"Task cancelled for proxy {proxy_type}://{proxy}")
         except Exception as e:
             log(f"ERROR: Proxy connection failed - {proxy_type}://{proxy} - {safe_str(e)[:50]}...")
+            failed_count += 1
         finally:
+            total_tested += 1
+            update_progress()
             if 'jar' in locals():
                 jar.clear()
 
+    async def run_proxies_once(self, proxies_list, proxy_type):
+        """Запускает один раунд тестирования всех прокси и завершается"""
+        global total_proxies
+        total_proxies = len(proxies_list)
+        log(f"Starting test of {total_proxies} proxies of type {proxy_type}")
+        
+        tasks = []
+        for proxy in proxies_list:
+            task = asyncio.create_task(self.request(proxy, proxy_type))
+            tasks.append(task)
+            await asyncio.sleep(0.1)  # Небольшая задержка при запуске
+        
+        try:
+            await asyncio.gather(*tasks)
+        except Exception as e:
+            log(f"Error in run_proxies_once: {safe_str(e)}")
+        
+        log(f"\n✅ Testing complete! Results: ✅ {working_count} | ❌ {failed_count} | Total: {total_tested}")
+
     async def run_proxies_continuous(self, proxies_list, proxy_type):
+        """Бесконечный режим (оставлен для совместимости)"""
         log(f"Starting continuous mode with {len(proxies_list)} proxies of type {proxy_type}")
         tasks = []
         for proxy in proxies_list:
             task = asyncio.create_task(self.continuous_request(proxy, proxy_type))
             tasks.append(task)
-            await asyncio.sleep(0.1)  # Небольшая задержка при запуске
+            await asyncio.sleep(0.1)
         
         try:
             await asyncio.gather(*tasks)
@@ -152,11 +222,15 @@ class Telegram:
                 pass
             await asyncio.sleep(1)
 
-    async def run_auto_continuous(self, proxies):
-        log(f"Starting continuous auto mode with {len(proxies)} proxies")
+    async def run_auto_once(self, proxies):
+        """Запускает один раунд тестирования для auto режима"""
+        global total_proxies
+        total_proxies = len(proxies)
+        log(f"Starting auto test of {total_proxies} proxies")
+        
         tasks = []
         for proxy_type, proxy in proxies:
-            task = asyncio.create_task(self.continuous_request(proxy, proxy_type))
+            task = asyncio.create_task(self.request(proxy, proxy_type))
             tasks.append(task)
             await asyncio.sleep(0.1)
         
@@ -164,6 +238,8 @@ class Telegram:
             await asyncio.gather(*tasks)
         except Exception as e:
             log(f"Error in auto mode: {safe_str(e)}")
+        
+        log(f"\n✅ Auto test complete! Results: ✅ {working_count} | ❌ {failed_count} | Total: {total_tested}")
 
     async def run_rotated_continuous(self, proxy: str, proxy_type: str):
         log(f"Starting continuous rotated mode with proxy {proxy_type}://{proxy}")
@@ -235,9 +311,15 @@ class Auto:
             tasks.extend([self.scrap(source_url, proxy_type) for source_url in sources])
 
         await asyncio.gather(*tasks)
-        log(f"Proxy scraping complete. Total proxies found: {len(self.proxies)}")
+        
+        # Удаляем дубликаты
+        original_count = len(self.proxies)
+        self.proxies = remove_duplicates_auto(self.proxies)
+        log(f"Proxy scraping complete. Found: {original_count} proxies, after dedup: {len(self.proxies)}")
 
 async def main():
+    global total_tested, total_proxies, working_count, failed_count
+    
     parser = ArgumentParser()
     parser.add_argument("-c", "--channel", dest="channel", help="Channel user Without @ (e.g: MyChannel1234)", type=str, required=True)
     parser.add_argument("-pt", "--post", dest="post", help="Post number (ID) (e.g: 1921)", type=int, required=True)
@@ -259,11 +341,18 @@ async def main():
                 file_proxies = file.read().splitlines()
             log(f"Loaded {len(file_proxies)} proxies from file {args.proxy}")
             
+            # Удаляем дубликаты
+            file_proxies = remove_duplicates(file_proxies)
+            log(f"After dedup: {len(file_proxies)} proxies")
+            
             # Объединяем с рабочими, удаляем дубли
             all_proxies = list(set(file_proxies + working))
+            all_proxies = remove_duplicates(all_proxies)
             log(f"Total unique proxies after merging with working: {len(all_proxies)}")
             
-            await api.run_proxies_continuous(all_proxies, args.type)
+            # Запускаем один раз
+            await api.run_proxies_once(all_proxies, args.type)
+            
         except Exception as e:
             log(f"Error in list mode: {safe_str(e)}")
 
@@ -302,12 +391,19 @@ async def main():
                 except:
                     continue
             
+            # Удаляем дубликаты в working_parsed
+            working_parsed = remove_duplicates_auto(working_parsed)
+            log(f"Working proxies after dedup: {len(working_parsed)}")
+            
+            # Удаляем дубликаты в new_proxies
+            new_proxies = remove_duplicates_auto(new_proxies)
+            
             # Итоговый список для отправки
             all_proxies = working_parsed + new_proxies
-            log(f"Total proxies to run: {len(all_proxies)}")
+            log(f"Total proxies to test: {len(all_proxies)}")
             
             if all_proxies:
-                await api.run_auto_continuous(all_proxies)
+                await api.run_auto_once(all_proxies)
             else:
                 log("No proxies to run")
                 
@@ -319,6 +415,6 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        log("Program terminated by user")
+        log("\n🛑 Program terminated by user")
     except Exception as e:
         log(f"Unhandled exception: {safe_str(e)}")
