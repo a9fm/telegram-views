@@ -16,9 +16,9 @@ from fake_useragent import UserAgent
 WORKING_FILE = "working.txt"
 DEAD_FILE = "dead.txt"
 POSTS_COUNT = 3
-VIEWS_PER_POST = 10
 CONCURRENCY = 100
 PROXY_TIMEOUT = 5
+MAX_USES_PER_PROXY = 5  # Каждый прокси можно использовать 5 раз
 
 # Пути к файлам с источниками
 AUTO_HTTP = "auto/http.txt"
@@ -64,30 +64,28 @@ def save_dead_proxy(proxy):
         f.write(proxy + "\n")
     stats['dead'] += 1
 
+def load_dead_proxies():
+    if os.path.exists(DEAD_FILE):
+        with open(DEAD_FILE, "r") as f:
+            return set(line.strip() for line in f if line.strip())
+    return set()
+
 # ============================================
 # 📖 ЧТЕНИЕ ИСТОЧНИКОВ ИЗ ФАЙЛОВ
 # ============================================
 def load_source_urls():
-    """Загружает ссылки на прокси из файлов auto/"""
-    sources = {
-        'http': [],
-        'socks4': [],
-        'socks5': []
-    }
+    sources = {'http': [], 'socks4': [], 'socks5': []}
     
-    # Читаем http.txt
     if os.path.exists(AUTO_HTTP):
         with open(AUTO_HTTP, 'r') as f:
             sources['http'] = [line.strip() for line in f if line.strip() and not line.startswith('#')]
         log(f"📁 Загружено {len(sources['http'])} HTTP источников")
     
-    # Читаем socks4.txt
     if os.path.exists(AUTO_SOCKS4):
         with open(AUTO_SOCKS4, 'r') as f:
             sources['socks4'] = [line.strip() for line in f if line.strip() and not line.startswith('#')]
         log(f"📁 Загружено {len(sources['socks4'])} SOCKS4 источников")
     
-    # Читаем socks5.txt
     if os.path.exists(AUTO_SOCKS5):
         with open(AUTO_SOCKS5, 'r') as f:
             sources['socks5'] = [line.strip() for line in f if line.strip() and not line.startswith('#')]
@@ -99,26 +97,21 @@ def load_source_urls():
 # 🌐 ПАРСИНГ ПРОКСИ С ИСТОЧНИКОВ
 # ============================================
 async def parse_proxies_from_url(source_url: str, proxy_type: str):
-    """Парсит прокси с URL источника"""
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(source_url, timeout=15) as resp:
                 if resp.status == 200:
                     text = await resp.text()
-                    # Ищем IP:port
                     pattern = r'\b(?:\d{1,3}\.){3}\d{1,3}:\d{2,5}\b'
                     proxies = re.findall(pattern, text)
-                    
-                    # Добавляем тип
                     result = [f"{proxy_type}://{p}" for p in proxies]
                     log(f"📥 {source_url.split('/')[-1]}: {len(result)} {proxy_type} прокси")
                     return result
-    except Exception as e:
-        log(f"❌ Ошибка загрузки {source_url}: {e}")
+    except:
+        pass
     return []
 
 async def parse_all_proxies():
-    """Парсит прокси со всех источников из auto/ файлов"""
     log("🔍 Начинаю парсинг прокси из источников...")
     
     sources = load_source_urls()
@@ -129,56 +122,53 @@ async def parse_all_proxies():
         for url in urls:
             tasks.append(parse_proxies_from_url(url, proxy_type))
     
-    if not tasks:
-        log("❌ Нет источников для парсинга!")
-        return []
-    
     results = await asyncio.gather(*tasks)
     
     for proxies in results:
         all_proxies.extend(proxies)
     
-    # Убираем дубликаты
     unique = list(set(all_proxies))
     stats['parsed'] = len(unique)
     
-    log(f"📊 Всего спарсено: {len(all_proxies)} прокси, уникальных: {len(unique)}")
-    return unique
+    dead_set = load_dead_proxies()
+    alive = [p for p in unique if p not in dead_set]
+    
+    log(f"📊 Всего: {len(all_proxies)} → уникальных: {len(unique)} → без мертвых: {len(alive)}")
+    return alive
 
 # ============================================
 # 🔍 ПРОВЕРКА ПРОКСИ
 # ============================================
 async def check_proxy(proxy_url: str, test_url: str):
-    """Проверяет работает ли прокси"""
     try:
         connector = ProxyConnector.from_url(proxy_url, rdns=True)
         async with aiohttp.ClientSession(connector=connector) as session:
             headers = {"User-Agent": UserAgent().random}
-            
-            async with session.get(
-                test_url,
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=PROXY_TIMEOUT)
-            ) as response:
-                
+            async with session.get(test_url, headers=headers, timeout=aiohttp.ClientTimeout(total=PROXY_TIMEOUT)) as response:
                 if response.status == 200:
                     html = await response.text()
                     if 'data-view="' in html:
                         return True
-        return False
     except:
-        return False
+        pass
+    return False
 
 async def test_proxies_batch(proxies, test_url):
-    """Тестирует пачку прокси"""
     log(f"🧪 Тестирую {len(proxies)} прокси...")
-    semaphore = asyncio.Semaphore(500)  
+    
+    dead_set = load_dead_proxies()
+    proxies = [p for p in proxies if p not in dead_set]
+    log(f"📉 После фильтрации мертвых: {len(proxies)}")
+    
+    semaphore = asyncio.Semaphore(200)
+    working = []
     
     async def test_one(proxy):
         async with semaphore:
             stats['tested'] += 1
             if await check_proxy(proxy, test_url):
                 save_working_proxy(proxy)
+                working.append(proxy)
                 update_progress()
                 return True
             else:
@@ -186,10 +176,14 @@ async def test_proxies_batch(proxies, test_url):
                 update_progress()
                 return False
     
-    tasks = [test_one(p) for p in proxies]
-    results = await asyncio.gather(*tasks)
+    chunk_size = 1000
+    for i in range(0, len(proxies), chunk_size):
+        chunk = proxies[i:i+chunk_size]
+        tasks = [test_one(p) for p in chunk]
+        await asyncio.gather(*tasks)
+        log(f"📊 Чанк {i//chunk_size + 1}: найдено {len(working)} рабочих")
+        await asyncio.sleep(1)
     
-    working = [p for p, r in zip(proxies, results) if r]
     log(f"\n✅ Найдено {len(working)} рабочих прокси")
     return working
 
@@ -197,7 +191,6 @@ async def test_proxies_batch(proxies, test_url):
 # 🎯 ОТПРАВКА ПРОСМОТРА
 # ============================================
 async def send_view(channel: str, post_id: int, proxy_url: str = None):
-    """Отправляет просмотр"""
     try:
         connector = None
         if proxy_url:
@@ -206,7 +199,6 @@ async def send_view(channel: str, post_id: int, proxy_url: str = None):
         async with aiohttp.ClientSession(connector=connector) as session:
             ua = UserAgent().random
             
-            # Получаем токен
             headers = {
                 "User-Agent": ua,
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -226,7 +218,6 @@ async def send_view(channel: str, post_id: int, proxy_url: str = None):
                 
                 token = token_match.group(1)
                 
-                # Отправляем просмотр
                 view_headers = {
                     "User-Agent": ua,
                     "Referer": embed_url,
@@ -253,7 +244,6 @@ async def send_view(channel: str, post_id: int, proxy_url: str = None):
 # 🌐 ПАРСИНГ ПОСТОВ
 # ============================================
 async def get_last_posts(channel: str):
-    """Получает последние посты"""
     url = f"https://t.me/s/{channel}"
     
     async with aiohttp.ClientSession() as session:
@@ -262,7 +252,6 @@ async def get_last_posts(channel: str):
             async with session.get(url, headers=headers, timeout=10) as resp:
                 html = await resp.text()
                 
-                # Ищем ID постов
                 pattern = rf'data-post="{channel}/(\d+)"'
                 post_ids = re.findall(pattern, html)
                 
@@ -280,55 +269,11 @@ async def get_last_posts(channel: str):
     return []
 
 # ============================================
-# 🚀 РЕЖИМЫ РАБОТЫ
+# 🚀 РЕЖИМ LIST (БЕСКОНЕЧНАЯ НАКРУТКА)
 # ============================================
-async def auto_mode(channel: str):
-    """Режим AUTO - парсит прокси из auto/ файлов, тестирует, использует"""
-    log("🚀 Запущен AUTO режим (с парсингом из auto/ файлов)")
-    
-    # 1. Получаем посты
-    post_ids = await get_last_posts(channel)
-    if not post_ids:
-        log("❌ Нет постов")
-        return
-    
-    # 2. Парсим свежие прокси из источников
-    fresh_proxies = await parse_all_proxies()
-    if not fresh_proxies:
-        log("❌ Не удалось спарсить прокси")
-        return
-    
-    # 3. Тестируем на первом посте
-    test_url = f"https://t.me/{channel}/{post_ids[0]}?embed=1&mode=tme"
-    working = await test_proxies_batch(fresh_proxies, test_url)
-    
-    if not working:
-        log("❌ Нет рабочих прокси")
-        return
-    
-    # 4. Запускаем накрутку
-    log(f"🎯 Запуск накрутки на {post_ids}")
-    all_tasks = []
-    for post_id in post_ids:
-        for _ in range(VIEWS_PER_POST):
-            proxy = random.choice(working)
-            all_tasks.append(send_view(channel, post_id, proxy))
-    
-    semaphore = asyncio.Semaphore(CONCURRENCY)
-    
-    async def run_with_limit(task):
-        async with semaphore:
-            return await task
-    
-    tasks = [run_with_limit(t) for t in all_tasks]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    
-    success = sum(1 for r in results if r is True)
-    log(f"\n✅ Накрутка: {success}/{len(all_tasks)} успешно")
-
 async def list_mode(channel: str):
-    """Режим LIST - использует готовые прокси из working.txt"""
-    log("🚀 Запущен LIST режим")
+    """Режим LIST - бесконечная накрутка, 5 попыток на прокси"""
+    log("🚀 Запущен LIST режим (бесконечная накрутка)")
     
     post_ids = await get_last_posts(channel)
     if not post_ids:
@@ -340,65 +285,107 @@ async def list_mode(channel: str):
         log("❌ Нет прокси в working.txt")
         return
     
-    log(f"✅ Использую {len(proxies)} готовых прокси")
+    log(f"✅ Загружено {len(proxies)} прокси")
     log(f"🎯 Посты: {post_ids}")
+    log(f"🔄 Каждый прокси будет использован максимум {MAX_USES_PER_PROXY} раз")
     
-    all_tasks = []
-    for post_id in post_ids:
-        for _ in range(VIEWS_PER_POST):
-            proxy = random.choice(proxies)
-            all_tasks.append(send_view(channel, post_id, proxy))
+    # Словарь для отслеживания использованных прокси
+    proxy_usage = {proxy: 0 for proxy in proxies}
+    total_attempts = 0
+    successful_views = 0
     
-    semaphore = asyncio.Semaphore(CONCURRENCY)
+    try:
+        while True:
+            # Выбираем прокси которые использовались меньше MAX_USES_PER_PROXY раз
+            available_proxies = [p for p in proxies if proxy_usage[p] < MAX_USES_PER_PROXY]
+            
+            if not available_proxies:
+                log(f"❌ Все прокси использованы {MAX_USES_PER_PROXY} раз. Завершаю работу.")
+                break
+            
+            # Создаем задачи для всех постов
+            tasks = []
+            for post_id in post_ids:
+                proxy = random.choice(available_proxies)
+                proxy_usage[proxy] += 1
+                total_attempts += 1
+                tasks.append(send_view(channel, post_id, proxy))
+            
+            # Запускаем параллельно
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Считаем успехи
+            success = sum(1 for r in results if r is True)
+            successful_views += success
+            
+            # Логируем прогресс
+            success_rate = (successful_views / total_attempts * 100) if total_attempts > 0 else 0
+            log(f"👁️ Успешно: {successful_views} | Попыток: {total_attempts} | {success_rate:.1f}% | Осталось прокси: {len(available_proxies)}")
+            
+            # Небольшая пауза между циклами
+            await asyncio.sleep(0.5)
+            
+    except KeyboardInterrupt:
+        log("\n🛑 Остановлено пользователем")
     
-    async def run_with_limit(task):
-        async with semaphore:
-            return await task
+    # Итог
+    elapsed = (datetime.now() - stats['start_time']).total_seconds()
+    success_rate = (successful_views / total_attempts * 100) if total_attempts > 0 else 0
     
-    tasks = [run_with_limit(t) for t in all_tasks]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    log(f"\n📊 ИТОГ:")
+    log(f"✅ Всего просмотров: {successful_views}")
+    log(f"🔄 Всего попыток: {total_attempts}")
+    log(f"📈 Процент успеха: {success_rate:.1f}%")
+    log(f"⏱️ Время работы: {elapsed:.1f}с")
+
+# ============================================
+# 🚀 РЕЖИМ AUTO
+# ============================================
+async def auto_mode(channel: str):
+    log("🚀 Запущен AUTO режим")
     
-    success = sum(1 for r in results if r is True)
-    log(f"\n✅ Накрутка: {success}/{len(all_tasks)} успешно")
+    post_ids = await get_last_posts(channel)
+    if not post_ids:
+        log("❌ Нет постов")
+        return
+    
+    fresh_proxies = await parse_all_proxies()
+    if not fresh_proxies:
+        log("❌ Не удалось спарсить прокси")
+        return
+    
+    test_url = f"https://t.me/{channel}/{post_ids[0]}?embed=1&mode=tme"
+    working = await test_proxies_batch(fresh_proxies, test_url)
+    
+    if not working:
+        log("❌ Нет рабочих прокси")
+        return
+    
+    # После тестирования запускаем list_mode с новыми прокси
+    global proxies
+    proxies = working
+    await list_mode(channel)
 
 # ============================================
 # 📌 ТОЧКА ВХОДА
 # ============================================
 if __name__ == "__main__":
     import sys
-    import argparse
     
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-c", "--channel", help="Канал без @")
-    parser.add_argument("-m", "--mode", help="auto или list")
-    args = parser.parse_args()
+    channel = input("📢 Канал (без @): ").strip()
     
-    if not args.channel:
-        args.channel = input("📢 Канал (без @): ").strip()
-    
-    if not args.mode:
-        print("\n1. Auto режим (парсинг из auto/ + тест + накрутка)")
-        print("2. List режим (только накрутка из working.txt)")
-        choice = input("\nВыбери (1/2): ").strip()
-        args.mode = "auto" if choice == "1" else "list"
+    print("\n1. Auto режим (парсинг из auto/ + тест + накрутка)")
+    print("2. List режим (только накрутка из working.txt)")
+    choice = input("\nВыбери (1/2): ").strip()
     
     print("=" * 50)
-    print(f"🤖 Telegram Views Bot - {args.mode.upper()} режим")
+    mode = "AUTO" if choice == "1" else "LIST"
+    print(f"🤖 Telegram Views Bot - {mode} режим")
     print("=" * 50)
     
     stats['start_time'] = datetime.now()
     
-    if args.mode == "auto":
-        asyncio.run(auto_mode(args.channel))
+    if choice == "1":
+        asyncio.run(auto_mode(channel))
     else:
-        asyncio.run(list_mode(args.channel))
-    
-    elapsed = (datetime.now() - stats['start_time']).total_seconds()
-    print("\n" + "=" * 50)
-    print("🏁 ГОТОВО")
-    print(f"✅ Рабочих прокси: {stats['working']}")
-    print(f"💀 Мертвых прокси: {stats['dead']}")
-    print(f"👁️ Просмотров: {stats['views_sent']}")
-    print(f"📥 Спарсено: {stats['parsed']}")
-    print(f"⏱️ Время: {elapsed:.1f}с")
-    print("=" * 50)
+        asyncio.run(list_mode(channel))
