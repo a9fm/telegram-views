@@ -172,8 +172,7 @@ async def check_proxy(proxy_url: str, test_url: str):
 async def test_proxies_batch(proxies, test_url):
     """Тестирует пачку прокси"""
     log(f"🧪 Тестирую {len(proxies)} прокси...")
-    
-    semaphore = asyncio.Semaphore(50)
+    semaphore = asyncio.Semaphore(500)  
     
     async def test_one(proxy):
         async with semaphore:
