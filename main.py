@@ -9,7 +9,7 @@ import random
 import os
 from datetime import datetime
 from fake_useragent import UserAgent
-from playwright.async_api import async_playwright
+from pyppeteer import launch
 
 # ============================================
 # 📋 НАСТРОЙКИ
@@ -166,59 +166,73 @@ async def test_proxies_batch(proxies, test_url, concurrency=50):
     return working
 
 # ============================================
-# 🎯 НАКРУТКА ПРОСМОТРОВ
+# 🎯 НАКРУТКА ПРОСМОТРОВ (PYPPETEER)
 # ============================================
 async def view_post_with_proxy(channel: str, post_id: int, proxy_url: str = None):
-    """Открывает пост через браузер с прокси"""
+    """Открывает пост через pyppeteer с прокси"""
     url = f"https://t.me/{channel}/{post_id}"
     
     try:
-        async with async_playwright() as p:
-            # Настройки браузера
-            browser_type = p.chromium
-            launch_options = {"headless": True}
-            
-            if proxy_url:
-                # Извлекаем тип и адрес
-                if "://" in proxy_url:
-                    proxy_type, proxy_addr = proxy_url.split("://", 1)
-                else:
-                    proxy_type, proxy_addr = "http", proxy_url
-                
-                launch_options["proxy"] = {
-                    "server": f"{proxy_type}://{proxy_addr}"
-                }
-            
-            browser = await browser_type.launch(**launch_options)
-            
-            context = await browser.new_context(
-                user_agent=UserAgent().random,
-                viewport={
-                    'width': random.randint(1024, 1920),
-                    'height': random.randint(768, 1080)
-                }
-            )
-            
-            page = await context.new_page()
-            
-            # Переходим на пост
-            await page.goto(url, wait_until='domcontentloaded', timeout=BROWSER_TIMEOUT)
-            
-            # Ждем загрузки
-            await page.wait_for_timeout(random.randint(3000, 6000))
-            
-            # Скроллим
-            await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
-            await page.wait_for_timeout(random.randint(1000, 2000))
-            
-            # Еще ждем
-            await page.wait_for_timeout(random.randint(2000, 4000))
-            
-            await browser.close()
-            
-            stats['views_sent'] += 1
-            update_progress()
-            return True
+        # Настройки запуска
+        launch_options = {
+            'headless': True,
+            'args': [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-accelerated-2d-canvas',
+                '--disable-gpu'
+            ]
+        }
+        
+        # Добавляем прокси если есть
+        if proxy_url:
+            # Извлекаем тип и адрес
+            if "://" in proxy_url:
+                proxy_type, proxy_addr = proxy_url.split("://", 1)
+                # pyppeteer понимает только http/s прокси
+                if proxy_type in ['http', 'https', 'socks5']:
+                    launch_options['args'].append(f'--proxy-server={proxy_url}')
+            else:
+                launch_options['args'].append(f'--proxy-server=http://{proxy_url}')
+        
+        # Запускаем браузер
+        browser = await launch(**launch_options)
+        
+        # Создаем страницу
+        page = await browser.newPage()
+        
+        # Устанавливаем User-Agent
+        await page.setUserAgent(UserAgent().random)
+        
+        # Устанавливаем viewport
+        await page.setViewport({
+            'width': random.randint(1024, 1920),
+            'height': random.randint(768, 1080)
+        })
+        
+        # Переходим на пост
+        await page.goto(url, {
+            'waitUntil': 'domcontentloaded',
+            'timeout': BROWSER_TIMEOUT
+        })
+        
+        # Ждем загрузки
+        await asyncio.sleep(random.randint(3, 6))
+        
+        # Скроллим
+        await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+        await asyncio.sleep(random.randint(1, 2))
+        
+        # Еще ждем
+        await asyncio.sleep(random.randint(2, 4))
+        
+        # Закрываем браузер
+        await browser.close()
+        
+        stats['views_sent'] += 1
+        update_progress()
+        return True
             
     except Exception as e:
         log(f"❌ Ошибка просмотра {post_id} через {proxy_url}: {str(e)[:50]}")
@@ -228,7 +242,7 @@ async def run_views(channel: str, post_ids: list, working_proxies: list, views_p
     """Запускает накрутку на все посты"""
     log(f"🚀 Запуск накрутки на {len(post_ids)} постов, {views_per_post} просмотров каждый")
     
-    # Создаем очередь задач
+    # Создаем список задач
     tasks = []
     for post_id in post_ids:
         for _ in range(views_per_post):
@@ -243,9 +257,9 @@ async def run_views(channel: str, post_ids: list, working_proxies: list, views_p
             return await task
     
     limited_tasks = [run_with_limit(task) for task in tasks]
-    results = await asyncio.gather(*limited_tasks)
+    results = await asyncio.gather(*limited_tasks, return_exceptions=True)
     
-    success = sum(1 for r in results if r)
+    success = sum(1 for r in results if r is True)
     log(f"\n✅ Накрутка завершена: {success}/{len(tasks)} успешно")
 
 # ============================================
@@ -253,7 +267,7 @@ async def run_views(channel: str, post_ids: list, working_proxies: list, views_p
 # ============================================
 async def main():
     log("=" * 50)
-    log("🤖 Telegram View Bot v2.0")
+    log("🤖 Telegram View Bot v2.0 (Pyppeteer)")
     log("=" * 50)
     
     # Ввод данных
@@ -276,21 +290,20 @@ async def main():
         want_test = input("🔍 Запустить тестирование прокси? (y/n): ").strip().lower()
         
         if want_test == 'y':
-            # Парсим свежие прокси
-            from auto import Auto  # Импортируем твой Auto класс
-            auto = Auto()
-            await auto.init()
+            # Здесь должен быть твой Auto класс для парсинга прокси
+            # from auto import Auto
+            # auto = Auto()
+            # await auto.init()
             
-            # Берем первые 1000 для теста
-            test_proxies = [f"{pt}://{p}" for pt, p in auto.proxies[:1000]]
-            
-            # Тестируем на первом посте
-            test_url = f"https://t.me/{channel}/{post_ids[0]}?embed=1&mode=tme"
-            working_proxies = await test_proxies_batch(test_proxies, test_url)
+            # Пока просто заглушка
+            log("❌ Нужно добавить парсинг прокси")
+            return
     
     if not working_proxies:
         log("❌ Нет рабочих прокси!")
         return
+    
+    log(f"✅ Использую {len(working_proxies)} рабочих прокси")
     
     # Запускаем накрутку
     await run_views(channel, post_ids, working_proxies, VIEWS_PER_POST)
@@ -304,6 +317,18 @@ async def main():
     log(f"👁️ Просмотров отправлено: {stats['views_sent']}")
     log(f"⏱️ Время работы: {elapsed:.1f}с")
     log("=" * 50)
+
+# ============================================
+# 🔧 КЛАСС AUTO (ЕСЛИ НУЖЕН)
+# ============================================
+class Auto:
+    """Класс для парсинга прокси - вставь свой код"""
+    def __init__(self):
+        self.proxies = []
+    
+    async def init(self):
+        # Твой код парсинга прокси
+        pass
 
 if __name__ == "__main__":
     try:
